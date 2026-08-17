@@ -1,165 +1,317 @@
 #include <Wire.h>
+#include <string.h>
+#include <math.h>
 
-// ==========================================
-// 1. CLASSE MÈRE (Sécurisée pour ARM Cortex)
-// ==========================================
-class SensorEmulator {
-protected:
-    uint8_t _address;
-    
-    // CRITIQUE : volatile force le CPU à lire la vraie mémoire RAM à chaque fois
-    volatile uint8_t _regPointer; 
-    volatile uint8_t _registers[256]; 
+class Bmp580Emulator; // forward declaration - necessaire a cause de l'auto-generation
+                       // de prototypes par l'IDE Arduino
 
-public:
-    SensorEmulator(uint8_t address) : _address(address), _regPointer(0) {
-        // Pas de memset sur du volatile, on utilise une boucle standard
-        for(int i = 0; i < 256; i++) _registers[i] = 0; 
+// ================== Registres BMP580 ==================
+#define REG_CHIP_ID     0x01
+#define REG_REV_ID      0x02
+#define REG_TEMP_XLSB   0x1D
+#define REG_TEMP_LSB    0x1E
+#define REG_TEMP_MSB    0x1F
+#define REG_PRESS_XLSB  0x20
+#define REG_PRESS_LSB   0x21
+#define REG_PRESS_MSB   0x22
+#define REG_INT_STATUS  0x27
+#define REG_STATUS      0x28
+#define REG_DSP_CONFIG  0x30
+#define REG_OSR_CONFIG  0x36
+#define REG_ODR_CONFIG  0x37
+#define REG_OSR_EFF     0x38
+#define REG_CMD         0x7E
+
+#define CHIP_ID_BMP580  0x50
+#define REV_ID_VALUE    0x32
+#define STATUS_NVM_RDY_BIT   0x02
+#define INT_STATUS_DRDY_BIT  0x01
+#define INT_STATUS_POR_BIT   0x10
+#define ODR_CONFIG_RESET_VAL 0x70
+#define DSP_CONFIG_RESET_VAL 0x03
+
+// ================== Identite (clignotement LED) ==================
+#define PICO_ID   1        // ce Pico = BMP1 + BMP2
+#define LED_PIN   LED_BUILTIN
+#define BLINK_MS  150
+#define PAUSE_MS  1000
+
+// ================== SEP_MECHD ==================
+#define SEPMEC_PIN 2
+
+float sepmecOffset = 0;
+bool  sepmecTriggered = false;
+
+// ================== Profil de vol partage ==================
+struct FlightProfile {
+  float boostAccel = 80.0;  // m/s^2
+  float boostT = 3.0;       // s
+  float drogueRate = 20.0;  // m/s, vitesse de descente constante sous drogue
+  unsigned long t0 = 0;
+  bool running = false;
+
+  float apogeeTime() const {
+    float vBoost = boostAccel * boostT;
+    return boostT + vBoost / 9.81;
+  }
+
+  float apogeeAltitude() const {
+    float vBoost   = boostAccel * boostT;
+    float altBoost = 0.5 * boostAccel * boostT * boostT;
+    return altBoost + (vBoost * vBoost) / (2 * 9.81);
+  }
+
+  float altitude(float t) const {
+    const float g = 9.81;
+    if (t < 0) return 0;
+    if (t < boostT) return 0.5 * boostAccel * t * t;
+
+    float aT = apogeeTime();
+    if (t < aT) {
+      float vBoost   = boostAccel * boostT;
+      float altBoost = 0.5 * boostAccel * boostT * boostT;
+      float dt = t - boostT;
+      return altBoost + vBoost * dt - 0.5 * g * dt * dt;
     }
 
-    uint8_t getAddress() const { return _address; }
+    // Phase drogue : descente a vitesse constante, plus de chute libre
+    float descAlt = apogeeAltitude() - drogueRate * (t - aT);
+    return descAlt > 0 ? descAlt : 0;
+  }
 
-    virtual void onReceive(int numBytes) {
-        if (numBytes == 0 || !Wire.available()) return;
-        
-        // 1. Le Master indique quel registre il veut cibler
-        _regPointer = Wire.read(); 
-        
-        // 2. Si le Master s'arrête là, c'est qu'il prépare une lecture (Repeated Start)
-        if (Wire.available() == 0) return;
-
-        // 3. S'il reste des données, c'est une écriture. On lit le premier octet.
-        uint8_t data = Wire.read();
-        
-        // On délègue le traitement à l'enfant (le BMP581)
-        handleWrite(_regPointer, data);
-
-        // 4. BOUCLIER FAÇON UNO : On draine le reste du buffer pour éviter tout désalignement
-        while (Wire.available()) Wire.read(); 
-    }
-
-    virtual void onRequest() {
-        // Calcul pour éviter un dépassement de mémoire (Out of Bounds)
-        int bytesToSend = 32; 
-        if (_regPointer + bytesToSend > 256) {
-            bytesToSend = 256 - _regPointer; 
-        }
-        
-        // CRITIQUE : On copie les variables 'volatile' dans un buffer statique propre
-        // avant de le donner au contrôleur matériel I2C du Pico.
-        uint8_t tempBuffer[32];
-        for (int i = 0; i < bytesToSend; i++) {
-            tempBuffer[i] = _registers[_regPointer + i];
-        }
-        
-        Wire.write(tempBuffer, bytesToSend);
-    }
-
-    // Méthode virtuelle pour gérer les écritures spécifiques du capteur
-    virtual void handleWrite(uint8_t reg, uint8_t data) {
-        _registers[reg] = data; // Comportement par défaut
-    }
+  float elapsed() const {
+    if (!running) return -1;
+    return (millis() - t0) / 1000.0;
+  }
 };
 
-// ==========================================
-// 2. CLASSE ENFANT : BMP581
-// ==========================================
-class BMP581Emulator : public SensorEmulator {
+FlightProfile flightProfile;
+
+float altitudeToPressure(float alt_m) {
+  return 101325.0 * pow(1.0 - 0.0065 * alt_m / 288.15, 5.255);
+}
+
+// ================== Classe BMP580 ==================
+class Bmp580Emulator {
 public:
-    BMP581Emulator(uint8_t address = 0x47) : SensorEmulator(address) {
-        powerOnReset();
+  void begin(TwoWire &bus, uint8_t sda, uint8_t scl, uint8_t addr,
+             const char* label, void (*onRecv)(int), void (*onReq)()) {
+    wire = &bus; sdaPin = sda; sclPin = scl; address = addr; name = label;
+    resetToDefaults();
+    startSlave(onRecv, onReq);
+  }
+
+  void poll(float altitude_m, float t) {
+    updateSimulatedData(altitude_m, t);
+    if (millis() - lastActivity > 3000) {
+      wire->end(); delay(2); startSlave(savedRecv, savedReq);
     }
+  }
 
-    void powerOnReset() {
-        for(int i = 0; i < 256; i++) _registers[i] = 0;
+  void setFault(float bias, float start, float duration) {
+    faultBiasPa = bias; faultStart = start; faultDuration = duration;
+  }
+  void clearFault() { faultBiasPa = 0; faultStart = -1; faultDuration = 0; }
 
-        _registers[0x01] = 0x50; // CHIP_ID (Attendu par Adafruit)
-        _registers[0x28] = 0x11; // STATUS : NVM et CMD Ready
-        _registers[0x27] = 0x03; // INT_STATUS : Data Ready
+  void handleReceive(int numBytes) {
+    lastActivity = millis();
+    if (numBytes <= 0) return;
+    regPointer = wire->read();
+    numBytes--;
 
-        injectTemperature(20.0);
-        injectPressure(101325.0);
+    Serial.print("["); Serial.print(name); Serial.print("] [WRITE] pointeur -> 0x");
+    Serial.println(regPointer, HEX);
+
+    while (numBytes > 0) {
+      uint8_t val = wire->read();
+      Serial.print("["); Serial.print(name); Serial.print("] [WRITE] reg 0x");
+      Serial.print(regPointer, HEX);
+      Serial.print(" = 0x");
+      Serial.println(val, HEX);
+      registers[regPointer] = val;
+
+      if (regPointer == REG_CMD && val == 0xB6) {
+        Serial.print("["); Serial.print(name); Serial.println("] [RESET] soft-reset recu");
+        resetToDefaults();
+      }
+      regPointer++;
+      numBytes--;
     }
+    registers[REG_OSR_EFF] = registers[REG_OSR_CONFIG] | 0x80;
+  }
 
-    // On intercepte la commande de Soft Reset (0xB6 dans le registre 0x7E)
-    void handleWrite(uint8_t reg, uint8_t data) override {
-        if (reg == 0x7E && data == 0xB6) {
-            powerOnReset(); 
-        } else {
-            _registers[reg] = data; 
-        }
+  void handleRequest() {
+    lastActivity = millis();
+    for (int i = 0; i < 8 && (regPointer + i) < 256; i++) {
+      wire->write(registers[regPointer + i]);
     }
+  }
 
-    void injectPressure(float pressure_pa) {
-        uint32_t raw_p = (uint32_t)(pressure_pa * 64.0f);
-        _registers[0x20] = raw_p & 0xFF;         // XLSB
-        _registers[0x21] = (raw_p >> 8) & 0xFF;  // LSB
-        _registers[0x22] = (raw_p >> 16) & 0xFF; // MSB
-    }
+private:
+  TwoWire *wire;
+  uint8_t sdaPin, sclPin, address;
+  const char* name;
+  void (*savedRecv)(int);
+  void (*savedReq)();
 
-    void injectTemperature(float temp_c) {
-        uint32_t raw_t = (uint32_t)(temp_c * 65536.0f);
-        _registers[0x1D] = raw_t & 0xFF;         // XLSB
-        _registers[0x1E] = (raw_t >> 8) & 0xFF;  // LSB
-        _registers[0x1F] = (raw_t >> 16) & 0xFF; // MSB
+  void startSlave(void (*onRecv)(int), void (*onReq)()) {
+    savedRecv = onRecv; savedReq = onReq;
+    wire->setSDA(sdaPin); wire->setSCL(sclPin);
+    wire->begin(address);
+    wire->onReceive(savedRecv);
+    wire->onRequest(savedReq);
+    lastActivity = millis();
+  }
+
+  volatile uint8_t registers[256];
+  volatile uint8_t regPointer = 0;
+  volatile unsigned long lastActivity = 0;
+
+  // --- FIX : STATUS et INT_STATUS DOIVENT etre remis ici, sinon un reset
+  // laisse ces registres a 0x00 jusqu'au prochain poll(), et le master lit
+  // souvent STATUS=0x00 juste apres le reset -> "capteur non trouve" ---
+  void resetToDefaults() {
+    memset((void*)registers, 0, sizeof(registers));
+    registers[REG_CHIP_ID]    = CHIP_ID_BMP580;
+    registers[REG_REV_ID]     = REV_ID_VALUE;
+    registers[REG_ODR_CONFIG] = ODR_CONFIG_RESET_VAL;
+    registers[REG_DSP_CONFIG] = DSP_CONFIG_RESET_VAL;
+    registers[REG_STATUS]     = STATUS_NVM_RDY_BIT;
+    registers[REG_INT_STATUS] = INT_STATUS_DRDY_BIT | INT_STATUS_POR_BIT;
+  }
+
+  float faultBiasPa   = 0;
+  float faultStart    = -1;
+  float faultDuration = 0;
+
+  void updateSimulatedData(float altitude_m, float t) {
+    float pressure = altitudeToPressure(altitude_m);
+    if (faultStart >= 0 && t >= faultStart && t <= faultStart + faultDuration) {
+      pressure += faultBiasPa;
     }
+    float temperature = 22.5;
+
+    int32_t rawTemp  = (int32_t)(temperature * 65536.0);
+    int32_t rawPress = (int32_t)(pressure * 64.0);
+    registers[REG_TEMP_XLSB]  = rawTemp & 0xFF;
+    registers[REG_TEMP_LSB]   = (rawTemp >> 8) & 0xFF;
+    registers[REG_TEMP_MSB]   = (rawTemp >> 16) & 0xFF;
+    registers[REG_PRESS_XLSB] = rawPress & 0xFF;
+    registers[REG_PRESS_LSB]  = (rawPress >> 8) & 0xFF;
+    registers[REG_PRESS_MSB]  = (rawPress >> 16) & 0xFF;
+    registers[REG_STATUS]     = STATUS_NVM_RDY_BIT;
+    registers[REG_INT_STATUS] = INT_STATUS_DRDY_BIT | INT_STATUS_POR_BIT;
+  }
 };
 
-// ==========================================
-// 3. WRAPPERS & SETUP
-// ==========================================
+// ================== Instances et cablage ==================
+Bmp580Emulator bmpA; // 0x47, sur Wire  (I2C0) -> GPIO4/5
+Bmp580Emulator bmpB; // 0x46, sur Wire1 (I2C1) -> GPIO6/7
 
-BMP581Emulator myBMP(0x47);
+void onReceiveA(int n) { bmpA.handleReceive(n); }
+void onRequestA()      { bmpA.handleRequest(); }
+void onReceiveB(int n) { bmpB.handleReceive(n); }
+void onRequestB()      { bmpB.handleRequest(); }
 
-void i2c_receive_handler(int numBytes) {
-    myBMP.onReceive(numBytes);
+// ================== SEP_MECHD ==================
+void updateSepMech(float t) {
+  if (t < 0 || sepmecTriggered) return;
+  if (t >= (flightProfile.apogeeTime() + sepmecOffset)) {
+    pinMode(SEPMEC_PIN, OUTPUT);
+    digitalWrite(SEPMEC_PIN, HIGH);
+    sepmecTriggered = true;
+    Serial.println("[SEPMEC] Separation simulee declenchee");
+  }
 }
 
-void i2c_request_handler() {
-    myBMP.onRequest();
+// ================== Identite (clignotement LED) ==================
+void updateIdentityBlink() {
+  static unsigned long lastChange = 0;
+  static int flashCount = 0;
+  static bool ledState = false;
+
+  unsigned long now = millis();
+  unsigned long interval = ledState ? BLINK_MS
+                          : (flashCount >= PICO_ID ? PAUSE_MS : BLINK_MS);
+
+  if (now - lastChange < interval) return;
+  lastChange = now;
+
+  if (flashCount >= PICO_ID) flashCount = 0;
+
+  ledState = !ledState;
+  digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+  if (!ledState) flashCount++;
 }
 
+// ================== Commandes serie ==================
+float extractFloat(String cmd, String key, float defaultVal = 0) {
+  int idx = cmd.indexOf(key);
+  return idx < 0 ? defaultVal : cmd.substring(idx + key.length()).toFloat();
+}
+
+void applyFault(Bmp580Emulator &bmp, String cmd) {
+  if (cmd.indexOf("CLEAR") > 0) { bmp.clearFault(); return; }
+  bmp.setFault(extractFloat(cmd, "BIAS="), extractFloat(cmd, "START="), extractFloat(cmd, "DURATION="));
+}
+
+void handleCommand(String cmd) {
+  cmd.trim();
+  if (cmd.startsWith("PROFILE")) {
+    flightProfile.boostAccel = extractFloat(cmd, "BOOST_ACCEL=", flightProfile.boostAccel);
+    flightProfile.boostT     = extractFloat(cmd, "BOOST_T=", flightProfile.boostT);
+    flightProfile.drogueRate = extractFloat(cmd, "DROGUE_RATE=", flightProfile.drogueRate);
+    Serial.println("[CFG] Profil mis a jour");
+  } else if (cmd.startsWith("SEPMEC")) {
+    sepmecOffset = extractFloat(cmd, "OFFSET=");
+    Serial.print("[CFG] SEPMEC offset = "); Serial.println(sepmecOffset);
+  } else if (cmd.startsWith("FAULT")) {
+    if (cmd.indexOf("BMP1") > 0) applyFault(bmpA, cmd);
+    if (cmd.indexOf("BMP2") > 0) applyFault(bmpB, cmd);
+  } else if (cmd.startsWith("START")) {
+    flightProfile.t0 = millis();
+    flightProfile.running = true;
+    Serial.println("[CFG] Vol demarre");
+  } else if (cmd.startsWith("RESET")) {
+    flightProfile.running = false;
+    bmpA.clearFault(); bmpB.clearFault();
+    sepmecTriggered = false;
+    pinMode(SEPMEC_PIN, INPUT);
+    Serial.println("[CFG] Reset");
+  }
+}
+
+void parseSerialCommands() {
+  static String line;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') { handleCommand(line); line = ""; }
+    else if (c != '\r') { line += c; }
+  }
+}
+
+// ================== setup() / loop() ==================
 void setup() {
-    // Initialisation du port USB
-    Serial.begin(115200);
+  Serial.begin(115200);
+  delay(1500);
+  Serial.println("--- Emulateur 2x BMP580 (profil + defauts + sepmec) ---");
 
-    uint32_t t = millis();
-    while (!Serial && (millis() - t < 3000)) delay(10);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(SEPMEC_PIN, INPUT); // Hi-Z par defaut, R7 (10k pulldown) maintient LOW
 
-    Serial.println("\n--- DEMARRAGE SYSTEME HiL ---");
-    
-    Wire.setSDA(4);
-    Wire.setSCL(5);
-    Wire.begin(myBMP.getAddress()); 
-    Wire.onReceive(i2c_receive_handler);
-    Wire.onRequest(i2c_request_handler);
+  bmpA.begin(Wire,  4, 5, 0x47, "BMP47", onReceiveA, onRequestA);
+  bmpB.begin(Wire1, 6, 7, 0x46, "BMP46", onReceiveB, onRequestB);
 
-    pinMode(LED_BUILTIN, OUTPUT);    Serial.println("HiL Pico 2 V3 : I2C Slave actif sur l'adresse 0x47.");
+  Serial.println("Pret, en attente du master...");
 }
 
 void loop() {
-    static float fake_pressure = 101325.0;
-    static float delta = 1.0;
-    
-    // Variation de la pression
-    fake_pressure += delta;
-    if(fake_pressure > 101400.0 || fake_pressure < 101250.0) delta = -delta;
-    
-    myBMP.injectPressure(fake_pressure); 
-    
-    // HEARTBEAT : Affichage toutes les secondes pour confirmer que le code tourne
-    static uint32_t last_print = 0;
-    if (millis() - last_print > 1000) {
-        last_print = millis();
-        Serial.print("[PICO] Pression injectée : ");
-        Serial.print(fake_pressure);
-        Serial.println(" Pa");
-        
-        // Fait clignoter la LED très brièvement
-        digitalWrite(LED_BUILTIN, HIGH);
-        delay(10);
-        digitalWrite(LED_BUILTIN, LOW);
-    }
-    
-    delay(40); // 40ms + 10ms (led) = 50ms (20 Hz)
+  parseSerialCommands();
+  float t = flightProfile.elapsed();
+  float alt = (t >= 0) ? flightProfile.altitude(t) : 0;
+  bmpA.poll(alt, t);
+  bmpB.poll(alt, t);
+  updateSepMech(t);
+  updateIdentityBlink();
+  delay(20);
 }

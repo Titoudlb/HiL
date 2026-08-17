@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Panneau de controle HiL</title>
+<style>
+  :root {
+    --bg: #14151a;
+    --panel: #1c1e26;
+    --panel-2: #23252f;
+    --border: #33353f;
+    --text: #e8e8ec;
+    --text-dim: #9a9ba5;
+    --accent: #4f8cff;
+    --accent-dim: #2a4a8a;
+    --ok: #3ecf8e;
+    --warn: #f0a742;
+    --err: #f0555e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    max-width: 980px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 20px; font-weight: 600; margin: 8px 0 4px; }
+  .subtitle { color: var(--text-dim); font-size: 13px; margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 20px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+  }
+  .card h3 { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
+  .status { font-size: 12px; color: var(--text-dim); margin-bottom: 8px; }
+  .status.connected { color: var(--ok); }
+  button {
+    background: var(--accent-dim);
+    color: var(--text);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 7px 12px;
+    font-size: 13px;
+    cursor: pointer;
+    width: 100%;
+  }
+  button:hover { background: var(--accent); }
+  button.big {
+    background: var(--ok);
+    border-color: var(--ok);
+    color: #06301c;
+    font-weight: 600;
+    font-size: 15px;
+    padding: 12px;
+  }
+  button.big:hover { filter: brightness(1.1); }
+  section.panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  section.panel h2 { font-size: 14px; margin: 0 0 12px; }
+  .row { display: flex; gap: 12px; margin-bottom: 10px; align-items: center; flex-wrap: wrap; }
+  .row label { font-size: 12px; color: var(--text-dim); min-width: 130px; }
+  .row input[type=number] {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 5px;
+    padding: 6px 8px;
+    width: 90px;
+    font-size: 13px;
+  }
+  .fault-row {
+    display: grid;
+    grid-template-columns: 90px 26px 1fr 1fr 1fr;
+    gap: 8px;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+  .fault-row:last-child { border-bottom: none; }
+  .fault-row input[type=number] { width: 100%; }
+  .fault-row .fname { font-weight: 600; }
+  .upload-status {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .upload-status.ok { background: rgba(62,207,142,0.15); color: var(--ok); border: 1px solid var(--ok); }
+  .upload-status.err { background: rgba(240,85,94,0.15); color: var(--err); border: 1px solid var(--err); }
+  #log {
+    background: #0b0c0f;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    font-family: "SF Mono", Consolas, monospace;
+    font-size: 11.5px;
+    height: 160px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    color: #8fd68f;
+  }
+</style>
+</head>
+<body>
+
+<h1>Panneau de controle HiL</h1>
+<div class="subtitle">Ouvre ce fichier directement dans Chrome ou Edge (double-clic). Necessite l'API Web Serial.</div>
+
+<div class="grid" id="picoCards"></div>
+
+<section class="panel">
+  <h2>Profil de vol (parabolique)</h2>
+  <div class="row">
+    <label>Acceleration poussee</label>
+    <input type="number" id="boostAccel" value="80" step="1"> m/s2
+  </div>
+  <div class="row">
+    <label>Duree de poussee</label>
+    <input type="number" id="boostT" value="3" step="0.1"> s
+  </div>
+  <div class="row">
+    <label>Vitesse sous drogue</label>
+    <input type="number" id="drogueRate" value="20" step="1"> m/s
+  </div>
+  <div class="row" style="color: var(--text-dim); font-size: 12px;">
+    Apogee approx. : <span id="apogeePreview">-</span> m · atteinte a t = <span id="apogeeTimePreview">-</span> s · sol vers t = <span id="groundTimePreview">-</span> s
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Injection de defauts par capteur</h2>
+  <div id="faultRows"></div>
+</section>
+
+<section class="panel">
+  <h2>Separation mecanique (SEP_MECHD)</h2>
+  <div class="row">
+    <label><input type="radio" name="sepmecMode" value="nominal" checked> A l'apogee (nominal)</label>
+  </div>
+  <div class="row">
+    <label><input type="radio" name="sepmecMode" value="before"> Avant l'apogee, de</label>
+    <input type="number" id="sepmecBeforeSec" value="2" step="0.5" min="0"> s
+  </div>
+  <div class="row">
+    <label><input type="radio" name="sepmecMode" value="after"> Apres l'apogee, de</label>
+    <input type="number" id="sepmecAfterSec" value="2" step="0.5" min="0"> s
+  </div>
+</section>
+
+<button class="big" id="uploadBtn">Televerser vers les Pico connectes</button>
+<div id="uploadStatus" class="upload-status" style="display:none;"></div>
+
+<section class="panel" style="margin-top:16px;">
+  <h2>Journal</h2>
+  <div id="log"></div>
+</section>
+
+<script>
+const PICOS = [
+  { id: 'picoA', label: 'Pico A', desc: 'BMP1 + BMP2', sensors: ['BMP1', 'BMP2'], hasSepmec: true },
+  { id: 'picoB', label: 'Pico B', desc: 'KX134 + BMP3', sensors: ['BMP3'], hasSepmec: false },
+  { id: 'picoC', label: 'Pico C', desc: 'GNSS', sensors: [], hasSepmec: false },
+];
+
+const ports = {};   // id -> SerialPort
+const writers = {}; // id -> WritableStreamDefaultWriter
+
+const MAX_LOG_LINES = 300;
+let logLines = [];
+
+function log(msg) {
+  const time = new Date().toLocaleTimeString();
+  logLines.push(`[${time}] ${msg}`);
+  if (logLines.length > MAX_LOG_LINES) logLines.shift();
+  const el = document.getElementById('log');
+  el.textContent = logLines.join('\n');
+  el.scrollTop = el.scrollHeight;
+}
+
+function markDisconnected(id, label, reason) {
+  delete ports[id];
+  delete writers[id];
+  const statusEl = document.getElementById(`status-${id}`);
+  statusEl.textContent = 'Deconnecte';
+  statusEl.classList.remove('connected');
+  document.getElementById(`connect-${id}`).textContent = 'Connecter';
+  log(`${label} : deconnecte (${reason})`);
+}
+
+function showUploadStatus(ok, msg) {
+  const el = document.getElementById('uploadStatus');
+  el.textContent = msg;
+  el.className = 'upload-status ' + (ok ? 'ok' : 'err');
+  el.style.display = 'block';
+}
+
+function buildPicoCards() {
+  const grid = document.getElementById('picoCards');
+  PICOS.forEach(p => {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      <h3>${p.label}</h3>
+      <div class="status" id="status-${p.id}">Non connecte</div>
+      <div class="subtitle" style="margin-bottom:8px;">${p.desc}</div>
+      <button id="connect-${p.id}">Connecter</button>
+    `;
+    grid.appendChild(card);
+    document.getElementById(`connect-${p.id}`).onclick = () => connectPico(p.id, p.label);
+  });
+}
+
+function buildFaultRows() {
+  const container = document.getElementById('faultRows');
+  const header = document.createElement('div');
+  header.className = 'fault-row';
+  header.style.color = 'var(--text-dim)';
+  header.innerHTML = `<div>Capteur</div><div>On</div><div>Decalage (Pa)</div><div>A partir de (s)</div><div>Duree (s)</div>`;
+  container.appendChild(header);
+
+  ['BMP1', 'BMP2', 'BMP3'].forEach(name => {
+    const row = document.createElement('div');
+    row.className = 'fault-row';
+    row.innerHTML = `
+      <div class="fname">${name}</div>
+      <input type="checkbox" id="fault-${name}-on">
+      <input type="number" id="fault-${name}-bias" value="0" step="1">
+      <input type="number" id="fault-${name}-start" value="0" step="0.5">
+      <input type="number" id="fault-${name}-dur" value="0" step="0.5">
+    `;
+    container.appendChild(row);
+  });
+}
+
+async function connectPico(id, label) {
+  try {
+    const port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    ports[id] = port;
+    writers[id] = port.writable.getWriter();
+    document.getElementById(`status-${id}`).textContent = 'Connecte';
+    document.getElementById(`status-${id}`).classList.add('connected');
+    document.getElementById(`connect-${id}`).textContent = 'Reconnecter';
+    log(`${label} connecte.`);
+    readLoop(id, label, port);
+  } catch (e) {
+    log(`${label} : erreur de connexion (${e.message})`);
+  }
+}
+
+async function readLoop(id, label, port) {
+  const reader = port.readable.getReader();
+  const decoder = new TextDecoder();
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value).trim();
+      if (text) log(`${label} << ${text}`);
+    }
+  } catch (e) {
+    markDisconnected(id, label, 'lecture interrompue: ' + e.message);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function sendLine(id, label, line) {
+  if (!writers[id]) throw new Error('port non connecte');
+  const encoder = new TextEncoder();
+  await writers[id].write(encoder.encode(line + '\n'));
+  log(`${label} >> ${line}`);
+}
+
+function updateApogeePreview() {
+  const a = parseFloat(document.getElementById('boostAccel').value) || 0;
+  const t = parseFloat(document.getElementById('boostT').value) || 0;
+  const drogueRate = parseFloat(document.getElementById('drogueRate').value) || 1;
+  const g = 9.81;
+  const vBoost = a * t;
+  const altBoost = 0.5 * a * t * t;
+  const apogee = altBoost + (vBoost * vBoost) / (2 * g);
+  const apogeeTime = t + vBoost / g;
+  const groundTime = apogeeTime + apogee / drogueRate;
+  document.getElementById('apogeePreview').textContent = apogee.toFixed(0);
+  document.getElementById('apogeeTimePreview').textContent = apogeeTime.toFixed(1);
+  document.getElementById('groundTimePreview').textContent = groundTime.toFixed(1);
+}
+
+function getSepmecOffset() {
+  const mode = document.querySelector('input[name="sepmecMode"]:checked').value;
+  if (mode === 'before') return -Math.abs(parseFloat(document.getElementById('sepmecBeforeSec').value) || 0);
+  if (mode === 'after') return Math.abs(parseFloat(document.getElementById('sepmecAfterSec').value) || 0);
+  return 0;
+}
+
+async function upload() {
+  document.getElementById('uploadStatus').style.display = 'none';
+
+  const boostAccel = document.getElementById('boostAccel').value;
+  const boostT = document.getElementById('boostT').value;
+  const drogueRate = document.getElementById('drogueRate').value;
+  const profileCmd = `PROFILE BOOST_ACCEL=${boostAccel} BOOST_T=${boostT} DROGUE_RATE=${drogueRate}`;
+
+  const connectedPicos = PICOS.filter(p => ports[p.id]);
+  if (connectedPicos.length === 0) {
+    showUploadStatus(false, 'Aucun Pico connecte.');
+    return;
+  }
+
+  const succeeded = [];
+  const failed = [];
+
+  for (const p of PICOS) {
+    if (!ports[p.id]) continue;
+    try {
+      if (p.sensors.length > 0) {
+        await sendLine(p.id, p.label, profileCmd);
+      }
+      if (p.hasSepmec) {
+        await sendLine(p.id, p.label, `SEPMEC OFFSET=${getSepmecOffset()}`);
+      }
+      for (const sensor of p.sensors) {
+        const on = document.getElementById(`fault-${sensor}-on`).checked;
+        if (on) {
+          const bias = document.getElementById(`fault-${sensor}-bias`).value;
+          const start = document.getElementById(`fault-${sensor}-start`).value;
+          const dur = document.getElementById(`fault-${sensor}-dur`).value;
+          await sendLine(p.id, p.label, `FAULT ${sensor} BIAS=${bias} START=${start} DURATION=${dur}`);
+        } else {
+          await sendLine(p.id, p.label, `FAULT ${sensor} CLEAR`);
+        }
+      }
+      succeeded.push(p.label);
+    } catch (e) {
+      failed.push(p.label);
+      markDisconnected(p.id, p.label, e.message);
+    }
+  }
+
+  for (const p of PICOS) {
+    if (!ports[p.id]) continue;
+    try {
+      await sendLine(p.id, p.label, 'START');
+    } catch (e) {
+      if (!failed.includes(p.label)) failed.push(p.label);
+      markDisconnected(p.id, p.label, e.message);
+    }
+  }
+
+  log('Televersement termine.');
+  if (failed.length === 0) {
+    showUploadStatus(true, `Televerse avec succes sur : ${succeeded.join(', ')}.`);
+  } else if (succeeded.length > 0) {
+    showUploadStatus(false, `OK sur ${succeeded.join(', ')} — echec sur ${failed.join(', ')} (reconnecte-le puis reessaie).`);
+  } else {
+    showUploadStatus(false, `Echec sur tous les Pico connectes : ${failed.join(', ')}.`);
+  }
+}
+
+document.getElementById('boostAccel').addEventListener('input', updateApogeePreview);
+document.getElementById('boostT').addEventListener('input', updateApogeePreview);
+document.getElementById('drogueRate').addEventListener('input', updateApogeePreview);
+document.getElementById('uploadBtn').addEventListener('click', upload);
+
+if (!('serial' in navigator)) {
+  log('ATTENTION : Web Serial API non disponible. Utilise Chrome ou Edge.');
+}
+
+buildPicoCards();
+buildFaultRows();
+updateApogeePreview();
+</script>
+
+</body>
+</html>
