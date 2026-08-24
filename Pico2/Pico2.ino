@@ -55,9 +55,10 @@ class Bmp580Emulator; // forward declaration - necessaire a cause de l'auto-gene
 
 // ================== Profil de vol partage ==================
 struct FlightProfile {
-  float boostAccel = 80.0;  // m/s^2
-  float boostT = 3.0;       // s
-  float drogueRate = 20.0;  // m/s, vitesse de descente constante sous drogue
+  float boostAccel = 80.0;
+  float boostT = 3.0;
+  float drogueRate = 20.0;
+  float restT = 0;
   unsigned long t0 = 0;
   bool running = false;
 
@@ -90,8 +91,8 @@ struct FlightProfile {
   }
 
   float elapsed() const {
-    if (!running) return -1;
-    return (millis() - t0) / 1000.0;
+    if (!running) return -1e6;
+    return (millis() - t0) / 1000.0 - restT;
   }
 };
 
@@ -120,8 +121,15 @@ public:
 
   void setFault(float bias, float start, float duration) {
     faultBiasPa = bias; faultStart = start; faultDuration = duration;
+    faultActive = true; faultPersistent = false;
   }
-  void clearFault() { faultBiasPa = 0; faultStart = -1; faultDuration = 0; }
+  void setPersistentFault(float bias) {
+    faultBiasPa = bias; faultActive = true; faultPersistent = true;
+  }
+  void clearFault() {
+    faultActive = false; faultPersistent = false;
+    faultBiasPa = 0; faultStart = 0; faultDuration = 0;
+  }
 
   void handleReceive(int numBytes) {
     lastActivity = millis();
@@ -177,7 +185,6 @@ private:
   volatile uint8_t regPointer = 0;
   volatile unsigned long lastActivity = 0;
 
-  // --- Meme fix que Pico 1 : STATUS/INT_STATUS remis ici ---
   void resetToDefaults() {
     memset((void*)registers, 0, sizeof(registers));
     registers[REG_CHIP_ID]    = CHIP_ID_BMP580;
@@ -188,14 +195,18 @@ private:
     registers[REG_INT_STATUS] = INT_STATUS_DRDY_BIT | INT_STATUS_POR_BIT;
   }
 
-  float faultBiasPa   = 0;
-  float faultStart    = -1;
-  float faultDuration = 0;
+  bool  faultActive     = false;
+  bool  faultPersistent = false;
+  float faultBiasPa     = 0;
+  float faultStart      = 0;
+  float faultDuration   = 0;
 
   void updateSimulatedData(float altitude_m, float t) {
     float pressure = altitudeToPressure(altitude_m);
-    if (faultStart >= 0 && t >= faultStart && t <= faultStart + faultDuration) {
-      pressure += faultBiasPa;
+    if (faultActive) {
+      if (faultPersistent || (t >= faultStart && t <= faultStart + faultDuration)) {
+        pressure += faultBiasPa;
+      }
     }
     float temperature = 22.5;
 
@@ -326,7 +337,12 @@ float extractFloat(String cmd, String key, float defaultVal = 0) {
 
 void applyFault(Bmp580Emulator &bmp, String cmd) {
   if (cmd.indexOf("CLEAR") > 0) { bmp.clearFault(); return; }
-  bmp.setFault(extractFloat(cmd, "BIAS="), extractFloat(cmd, "START="), extractFloat(cmd, "DURATION="));
+  float bias = extractFloat(cmd, "BIAS=");
+  if (cmd.indexOf("PERSISTENT") > 0) {
+    bmp.setPersistentFault(bias);
+  } else {
+    bmp.setFault(bias, extractFloat(cmd, "START="), extractFloat(cmd, "DURATION="));
+  }
 }
 
 void handleCommand(String cmd) {
@@ -335,6 +351,7 @@ void handleCommand(String cmd) {
     flightProfile.boostAccel = extractFloat(cmd, "BOOST_ACCEL=", flightProfile.boostAccel);
     flightProfile.boostT     = extractFloat(cmd, "BOOST_T=", flightProfile.boostT);
     flightProfile.drogueRate = extractFloat(cmd, "DROGUE_RATE=", flightProfile.drogueRate);
+    flightProfile.restT      = extractFloat(cmd, "REST=", flightProfile.restT);
     Serial.println("[CFG] Profil mis a jour");
   } else if (cmd.startsWith("FAULT")) {
     if (cmd.indexOf("BMP3") > 0) applyFault(bmp3, cmd);
@@ -375,7 +392,7 @@ void setup() {
 void loop() {
   parseSerialCommands();
   float t = flightProfile.elapsed();
-  float alt = (t >= 0) ? flightProfile.altitude(t) : 0;
+  float alt = flightProfile.altitude(t);
   kx.poll();
   bmp3.poll(alt, t);
   updateIdentityBlink();

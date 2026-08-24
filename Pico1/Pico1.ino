@@ -47,6 +47,7 @@ struct FlightProfile {
   float boostAccel = 80.0;  // m/s^2
   float boostT = 3.0;       // s
   float drogueRate = 20.0;  // m/s, vitesse de descente constante sous drogue
+  float restT = 0;          // s, temps au repos sur le pas de tir avant le decollage
   unsigned long t0 = 0;
   bool running = false;
 
@@ -61,6 +62,7 @@ struct FlightProfile {
     return altBoost + (vBoost * vBoost) / (2 * 9.81);
   }
 
+  // t < 0 : encore au sol (repos ou pas encore demarre) -> altitude 0
   float altitude(float t) const {
     const float g = 9.81;
     if (t < 0) return 0;
@@ -74,14 +76,15 @@ struct FlightProfile {
       return altBoost + vBoost * dt - 0.5 * g * dt * dt;
     }
 
-    // Phase drogue : descente a vitesse constante, plus de chute libre
     float descAlt = apogeeAltitude() - drogueRate * (t - aT);
     return descAlt > 0 ? descAlt : 0;
   }
 
+  // t=0 correspond au decollage ; juste apres START, t = -restT (repos), puis
+  // remonte vers 0 au moment du decollage reel.
   float elapsed() const {
-    if (!running) return -1;
-    return (millis() - t0) / 1000.0;
+    if (!running) return -1e6; // jamais demarre - tres negatif, ne matche aucun fault
+    return (millis() - t0) / 1000.0 - restT;
   }
 };
 
@@ -110,8 +113,15 @@ public:
 
   void setFault(float bias, float start, float duration) {
     faultBiasPa = bias; faultStart = start; faultDuration = duration;
+    faultActive = true; faultPersistent = false;
   }
-  void clearFault() { faultBiasPa = 0; faultStart = -1; faultDuration = 0; }
+  void setPersistentFault(float bias) {
+    faultBiasPa = bias; faultActive = true; faultPersistent = true;
+  }
+  void clearFault() {
+    faultActive = false; faultPersistent = false;
+    faultBiasPa = 0; faultStart = 0; faultDuration = 0;
+  }
 
   void handleReceive(int numBytes) {
     lastActivity = millis();
@@ -167,9 +177,6 @@ private:
   volatile uint8_t regPointer = 0;
   volatile unsigned long lastActivity = 0;
 
-  // --- FIX : STATUS et INT_STATUS DOIVENT etre remis ici, sinon un reset
-  // laisse ces registres a 0x00 jusqu'au prochain poll(), et le master lit
-  // souvent STATUS=0x00 juste apres le reset -> "capteur non trouve" ---
   void resetToDefaults() {
     memset((void*)registers, 0, sizeof(registers));
     registers[REG_CHIP_ID]    = CHIP_ID_BMP580;
@@ -180,14 +187,18 @@ private:
     registers[REG_INT_STATUS] = INT_STATUS_DRDY_BIT | INT_STATUS_POR_BIT;
   }
 
-  float faultBiasPa   = 0;
-  float faultStart    = -1;
-  float faultDuration = 0;
+  bool  faultActive     = false;
+  bool  faultPersistent = false;
+  float faultBiasPa     = 0;
+  float faultStart      = 0;
+  float faultDuration   = 0;
 
   void updateSimulatedData(float altitude_m, float t) {
     float pressure = altitudeToPressure(altitude_m);
-    if (faultStart >= 0 && t >= faultStart && t <= faultStart + faultDuration) {
-      pressure += faultBiasPa;
+    if (faultActive) {
+      if (faultPersistent || (t >= faultStart && t <= faultStart + faultDuration)) {
+        pressure += faultBiasPa;
+      }
     }
     float temperature = 22.5;
 
@@ -252,7 +263,12 @@ float extractFloat(String cmd, String key, float defaultVal = 0) {
 
 void applyFault(Bmp580Emulator &bmp, String cmd) {
   if (cmd.indexOf("CLEAR") > 0) { bmp.clearFault(); return; }
-  bmp.setFault(extractFloat(cmd, "BIAS="), extractFloat(cmd, "START="), extractFloat(cmd, "DURATION="));
+  float bias = extractFloat(cmd, "BIAS=");
+  if (cmd.indexOf("PERSISTENT") > 0) {
+    bmp.setPersistentFault(bias);
+  } else {
+    bmp.setFault(bias, extractFloat(cmd, "START="), extractFloat(cmd, "DURATION="));
+  }
 }
 
 void handleCommand(String cmd) {
@@ -261,6 +277,7 @@ void handleCommand(String cmd) {
     flightProfile.boostAccel = extractFloat(cmd, "BOOST_ACCEL=", flightProfile.boostAccel);
     flightProfile.boostT     = extractFloat(cmd, "BOOST_T=", flightProfile.boostT);
     flightProfile.drogueRate = extractFloat(cmd, "DROGUE_RATE=", flightProfile.drogueRate);
+    flightProfile.restT      = extractFloat(cmd, "REST=", flightProfile.restT);
     Serial.println("[CFG] Profil mis a jour");
   } else if (cmd.startsWith("SEPMEC")) {
     sepmecOffset = extractFloat(cmd, "OFFSET=");
@@ -308,7 +325,7 @@ void setup() {
 void loop() {
   parseSerialCommands();
   float t = flightProfile.elapsed();
-  float alt = (t >= 0) ? flightProfile.altitude(t) : 0;
+  float alt = flightProfile.altitude(t); // gere deja t<0 (repos/pas demarre) -> 0
   bmpA.poll(alt, t);
   bmpB.poll(alt, t);
   updateSepMech(t);
