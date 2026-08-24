@@ -134,6 +134,10 @@
     <label>Vitesse sous drogue</label>
     <input type="number" id="drogueRate" value="20" step="1"> m/s
   </div>
+  <div class="row">
+    <label>Temps au repos avant decollage</label>
+    <input type="number" id="restDuration" value="0" step="1"> s
+  </div>
   <div class="row" style="color: var(--text-dim); font-size: 12px;">
     Apogee approx. : <span id="apogeePreview">-</span> m · atteinte a t = <span id="apogeeTimePreview">-</span> s · sol vers t = <span id="groundTimePreview">-</span> s
   </div>
@@ -142,6 +146,9 @@
 <section class="panel">
   <h2>Injection de defauts par capteur</h2>
   <div id="faultRows"></div>
+  <div class="row" style="color: var(--text-dim); font-size: 12px; margin-top: 4px;">
+    Laisse "a partir de" vide pour un defaut deja actif avant meme le decollage (utile pour tester le calcul d'altitude sol).
+  </div>
 </section>
 
 <section class="panel">
@@ -237,7 +244,7 @@ function buildFaultRows() {
       <div class="fname">${name}</div>
       <input type="checkbox" id="fault-${name}-on">
       <input type="number" id="fault-${name}-bias" value="0" step="1">
-      <input type="number" id="fault-${name}-start" value="0" step="0.5">
+      <input type="number" id="fault-${name}-start" step="0.5" placeholder="vide = deja actif">
       <input type="number" id="fault-${name}-dur" value="0" step="0.5">
     `;
     container.appendChild(row);
@@ -288,11 +295,12 @@ function updateApogeePreview() {
   const a = parseFloat(document.getElementById('boostAccel').value) || 0;
   const t = parseFloat(document.getElementById('boostT').value) || 0;
   const drogueRate = parseFloat(document.getElementById('drogueRate').value) || 1;
+  const rest = parseFloat(document.getElementById('restDuration').value) || 0;
   const g = 9.81;
   const vBoost = a * t;
   const altBoost = 0.5 * a * t * t;
   const apogee = altBoost + (vBoost * vBoost) / (2 * g);
-  const apogeeTime = t + vBoost / g;
+  const apogeeTime = rest + t + vBoost / g;
   const groundTime = apogeeTime + apogee / drogueRate;
   document.getElementById('apogeePreview').textContent = apogee.toFixed(0);
   document.getElementById('apogeeTimePreview').textContent = apogeeTime.toFixed(1);
@@ -312,7 +320,8 @@ async function upload() {
   const boostAccel = document.getElementById('boostAccel').value;
   const boostT = document.getElementById('boostT').value;
   const drogueRate = document.getElementById('drogueRate').value;
-  const profileCmd = `PROFILE BOOST_ACCEL=${boostAccel} BOOST_T=${boostT} DROGUE_RATE=${drogueRate}`;
+  const restDuration = document.getElementById('restDuration').value;
+  const profileCmd = `PROFILE BOOST_ACCEL=${boostAccel} BOOST_T=${boostT} DROGUE_RATE=${drogueRate} REST=${restDuration}`;
 
   const connectedPicos = PICOS.filter(p => ports[p.id]);
   if (connectedPicos.length === 0) {
@@ -336,9 +345,13 @@ async function upload() {
         const on = document.getElementById(`fault-${sensor}-on`).checked;
         if (on) {
           const bias = document.getElementById(`fault-${sensor}-bias`).value;
-          const start = document.getElementById(`fault-${sensor}-start`).value;
-          const dur = document.getElementById(`fault-${sensor}-dur`).value;
-          await sendLine(p.id, p.label, `FAULT ${sensor} BIAS=${bias} START=${start} DURATION=${dur}`);
+          const startRaw = document.getElementById(`fault-${sensor}-start`).value;
+          if (startRaw === '') {
+            await sendLine(p.id, p.label, `FAULT ${sensor} BIAS=${bias} PERSISTENT`);
+          } else {
+            const dur = document.getElementById(`fault-${sensor}-dur`).value;
+            await sendLine(p.id, p.label, `FAULT ${sensor} BIAS=${bias} START=${startRaw} DURATION=${dur}`);
+          }
         } else {
           await sendLine(p.id, p.label, `FAULT ${sensor} CLEAR`);
         }
@@ -373,6 +386,7 @@ async function upload() {
 document.getElementById('boostAccel').addEventListener('input', updateApogeePreview);
 document.getElementById('boostT').addEventListener('input', updateApogeePreview);
 document.getElementById('drogueRate').addEventListener('input', updateApogeePreview);
+document.getElementById('restDuration').addEventListener('input', updateApogeePreview);
 document.getElementById('uploadBtn').addEventListener('click', upload);
 
 if (!('serial' in navigator)) {
