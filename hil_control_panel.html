@@ -90,6 +90,23 @@
   .fault-row:last-child { border-bottom: none; }
   .fault-row input[type=number] { width: 100%; }
   .fault-row .fname { font-weight: 600; }
+  .disc-row {
+    display: grid;
+    grid-template-columns: 90px 26px 1fr;
+    gap: 8px;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+  .disc-row:last-child { border-bottom: none; }
+  .disc-row .fname { font-weight: 600; }
+  button.secondary {
+    background: transparent;
+    border: 1px solid var(--err);
+    color: var(--err);
+  }
+  button.secondary:hover { background: rgba(240,85,94,0.12); }
   .upload-status {
     margin-top: 10px;
     padding: 10px 12px;
@@ -164,10 +181,19 @@
     <label><input type="radio" name="sepmecMode" value="after"> Apres l'apogee, de</label>
     <input type="number" id="sepmecAfterSec" value="2" step="0.5" min="0"> s
   </div>
+  <div class="row" style="color: var(--accent); font-size: 12px; font-weight: 600;">
+    Reglage actuel qui sera televerse : <span id="sepmecSummary">-</span>
+  </div>
 </section>
 
-<button class="big" id="uploadBtn">Televerser vers les Pico connectes</button>
+<section class="panel">
+  <h2>Deconnexion simulee (cable coupe / soudure froide)</h2>
+  <div id="disconnectRows"></div>
+</section>
+
 <div id="uploadStatus" class="upload-status" style="display:none;"></div>
+<button class="big" id="uploadBtn">Televerser vers les Pico connectes</button>
+<button class="secondary" id="resetBtn" style="margin-top:8px;">Reset (efface defauts, deconnexions, profil de vol)</button>
 
 <section class="panel" style="margin-top:16px;">
   <h2>Journal</h2>
@@ -176,9 +202,9 @@
 
 <script>
 const PICOS = [
-  { id: 'picoA', label: 'Pico A', desc: 'BMP1 + BMP2', sensors: ['BMP1', 'BMP2'], hasSepmec: true },
-  { id: 'picoB', label: 'Pico B', desc: 'KX134 + BMP3', sensors: ['BMP3'], hasSepmec: false },
-  { id: 'picoC', label: 'Pico C', desc: 'GNSS', sensors: [], hasSepmec: false },
+  { id: 'picoA', label: 'Pico A', desc: 'BMP1 + BMP2', sensors: ['BMP1', 'BMP2'], hasSepmec: true, disconnectables: ['BMP1', 'BMP2'] },
+  { id: 'picoB', label: 'Pico B', desc: 'KX134 + BMP3', sensors: ['BMP3'], hasSepmec: false, disconnectables: ['KX', 'BMP3'] },
+  { id: 'picoC', label: 'Pico C', desc: 'GNSS', sensors: [], hasSepmec: false, disconnectables: ['GNSS'] },
 ];
 
 const ports = {};   // id -> SerialPort
@@ -206,11 +232,17 @@ function markDisconnected(id, label, reason) {
   log(`${label} : deconnecte (${reason})`);
 }
 
+let uploadStatusTimer = null;
+
 function showUploadStatus(ok, msg) {
   const el = document.getElementById('uploadStatus');
+  clearTimeout(uploadStatusTimer);
   el.textContent = msg;
   el.className = 'upload-status ' + (ok ? 'ok' : 'err');
   el.style.display = 'block';
+  if (ok) {
+    uploadStatusTimer = setTimeout(() => { el.style.display = 'none'; }, 4000);
+  }
 }
 
 function buildPicoCards() {
@@ -246,6 +278,28 @@ function buildFaultRows() {
       <input type="number" id="fault-${name}-bias" value="0" step="1">
       <input type="number" id="fault-${name}-start" step="0.5" placeholder="vide = deja actif">
       <input type="number" id="fault-${name}-dur" value="0" step="0.5">
+    `;
+    container.appendChild(row);
+  });
+}
+
+const DISCONNECTABLE_SENSORS = ['BMP1', 'BMP2', 'BMP3', 'KX', 'GNSS'];
+
+function buildDisconnectRows() {
+  const container = document.getElementById('disconnectRows');
+  const header = document.createElement('div');
+  header.className = 'disc-row';
+  header.style.color = 'var(--text-dim)';
+  header.innerHTML = `<div>Capteur</div><div>On</div><div>Delai apres upload (s)</div>`;
+  container.appendChild(header);
+
+  DISCONNECTABLE_SENSORS.forEach(name => {
+    const row = document.createElement('div');
+    row.className = 'disc-row';
+    row.innerHTML = `
+      <div class="fname">${name}</div>
+      <input type="checkbox" id="disc-${name}-on">
+      <input type="number" id="disc-${name}-at" value="0" step="0.5">
     `;
     container.appendChild(row);
   });
@@ -314,7 +368,18 @@ function getSepmecOffset() {
   return 0;
 }
 
+function updateSepmecSummary() {
+  const mode = document.querySelector('input[name="sepmecMode"]:checked').value;
+  const offset = getSepmecOffset();
+  let text;
+  if (mode === 'nominal') text = 'Nominal (a l\'apogee, offset=0)';
+  else if (mode === 'before') text = `${Math.abs(offset)}s AVANT l'apogee (offset=${offset})`;
+  else text = `${Math.abs(offset)}s APRES l'apogee (offset=${offset})`;
+  document.getElementById('sepmecSummary').textContent = text;
+}
+
 async function upload() {
+  clearTimeout(uploadStatusTimer);
   document.getElementById('uploadStatus').style.display = 'none';
 
   const boostAccel = document.getElementById('boostAccel').value;
@@ -335,11 +400,13 @@ async function upload() {
   for (const p of PICOS) {
     if (!ports[p.id]) continue;
     try {
-      if (p.sensors.length > 0) {
+      if (p.sensors.length > 0 || p.disconnectables.length > 0) {
         await sendLine(p.id, p.label, profileCmd);
       }
       if (p.hasSepmec) {
-        await sendLine(p.id, p.label, `SEPMEC OFFSET=${getSepmecOffset()}`);
+        const offset = getSepmecOffset();
+        await sendLine(p.id, p.label, `SEPMEC OFFSET=${offset}`);
+        log(`SEPMEC televerse : offset=${offset} (${document.getElementById('sepmecSummary').textContent})`);
       }
       for (const sensor of p.sensors) {
         const on = document.getElementById(`fault-${sensor}-on`).checked;
@@ -354,6 +421,15 @@ async function upload() {
           }
         } else {
           await sendLine(p.id, p.label, `FAULT ${sensor} CLEAR`);
+        }
+      }
+      for (const sensor of p.disconnectables) {
+        const on = document.getElementById(`disc-${sensor}-on`).checked;
+        if (on) {
+          const at = document.getElementById(`disc-${sensor}-at`).value;
+          await sendLine(p.id, p.label, `DISCONNECT ${sensor} AT=${at}`);
+        } else {
+          await sendLine(p.id, p.label, `DISCONNECT ${sensor} CLEAR`);
         }
       }
       succeeded.push(p.label);
@@ -377,17 +453,34 @@ async function upload() {
   if (failed.length === 0) {
     showUploadStatus(true, `Televerse avec succes sur : ${succeeded.join(', ')}.`);
   } else if (succeeded.length > 0) {
-    showUploadStatus(false, `OK sur ${succeeded.join(', ')} — echec sur ${failed.join(', ')} (reconnecte-le puis reessaie).`);
+    showUploadStatus(false, `OK sur ${succeeded.join(', ')}, echec sur ${failed.join(', ')} (reconnecte-le puis reessaie).`);
   } else {
     showUploadStatus(false, `Echec sur tous les Pico connectes : ${failed.join(', ')}.`);
   }
+}
+
+async function resetAll() {
+  document.getElementById('uploadStatus').style.display = 'none';
+  for (const p of PICOS) {
+    if (!ports[p.id]) continue;
+    try {
+      await sendLine(p.id, p.label, 'RESET');
+    } catch (e) {
+      markDisconnected(p.id, p.label, e.message);
+    }
+  }
+  log('Reset envoye a tous les Pico connectes.');
 }
 
 document.getElementById('boostAccel').addEventListener('input', updateApogeePreview);
 document.getElementById('boostT').addEventListener('input', updateApogeePreview);
 document.getElementById('drogueRate').addEventListener('input', updateApogeePreview);
 document.getElementById('restDuration').addEventListener('input', updateApogeePreview);
+document.querySelectorAll('input[name="sepmecMode"]').forEach(r => r.addEventListener('change', updateSepmecSummary));
+document.getElementById('sepmecBeforeSec').addEventListener('input', updateSepmecSummary);
+document.getElementById('sepmecAfterSec').addEventListener('input', updateSepmecSummary);
 document.getElementById('uploadBtn').addEventListener('click', upload);
+document.getElementById('resetBtn').addEventListener('click', resetAll);
 
 if (!('serial' in navigator)) {
   log('ATTENTION : Web Serial API non disponible. Utilise Chrome ou Edge.');
@@ -395,7 +488,9 @@ if (!('serial' in navigator)) {
 
 buildPicoCards();
 buildFaultRows();
+buildDisconnectRows();
 updateApogeePreview();
+updateSepmecSummary();
 </script>
 
 </body>

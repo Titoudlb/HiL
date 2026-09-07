@@ -113,6 +113,16 @@ public:
   }
 
   void poll(float altitude_m, float t) {
+    if (disconnectArmed && !disconnected) {
+      float sinceArm = (millis() - disconnectArmTime) / 1000.0;
+      if (sinceArm >= disconnectAt) {
+        wire->end();
+        disconnected = true;
+        Serial.print("["); Serial.print(name); Serial.println("] [DISCONNECT] simule - plus de reponse I2C");
+      }
+    }
+    if (disconnected) return;
+
     updateSimulatedData(altitude_m, t);
     if (millis() - lastActivity > 3000) {
       wire->end(); delay(2); startSlave(savedRecv, savedReq);
@@ -129,6 +139,19 @@ public:
   void clearFault() {
     faultActive = false; faultPersistent = false;
     faultBiasPa = 0; faultStart = 0; faultDuration = 0;
+  }
+
+  void armDisconnect(float atT) {
+    disconnectArmed = true;
+    disconnectAt = atT;
+    disconnectArmTime = millis();
+  }
+  void clearDisconnect() {
+    disconnectArmed = false;
+    if (disconnected) {
+      disconnected = false;
+      startSlave(savedRecv, savedReq);
+    }
   }
 
   void handleReceive(int numBytes) {
@@ -201,6 +224,11 @@ private:
   float faultStart      = 0;
   float faultDuration   = 0;
 
+  bool  disconnectArmed    = false;
+  float disconnectAt       = 0;
+  unsigned long disconnectArmTime = 0;
+  bool  disconnected       = false;
+
   void updateSimulatedData(float altitude_m, float t) {
     float pressure = altitudeToPressure(altitude_m);
     if (faultActive) {
@@ -233,9 +261,32 @@ public:
     startSlave(onRecv, onReq);
   }
 
-  void poll() {
+  void poll(float t) {
+    if (disconnectArmed && !disconnected) {
+      float sinceArm = (millis() - disconnectArmTime) / 1000.0;
+      if (sinceArm >= disconnectAt) {
+        wire->end();
+        disconnected = true;
+        Serial.print("["); Serial.print(name); Serial.println("] [DISCONNECT] simule - plus de reponse I2C");
+      }
+    }
+    if (disconnected) return;
+
     if (millis() - lastActivity > 3000) {
       wire->end(); delay(2); startSlave(savedRecv, savedReq);
+    }
+  }
+
+  void armDisconnect(float atT) {
+    disconnectArmed = true;
+    disconnectAt = atT;
+    disconnectArmTime = millis();
+  }
+  void clearDisconnect() {
+    disconnectArmed = false;
+    if (disconnected) {
+      disconnected = false;
+      startSlave(savedRecv, savedReq);
     }
   }
 
@@ -282,6 +333,11 @@ private:
   volatile uint8_t registers[256];
   volatile uint8_t regPointer = 0;
   volatile unsigned long lastActivity = 0;
+
+  bool  disconnectArmed    = false;
+  float disconnectAt       = 0;
+  unsigned long disconnectArmTime = 0;
+  bool  disconnected       = false;
 
   void resetToDefaults() {
     memset((void*)registers, 0, sizeof(registers));
@@ -353,6 +409,15 @@ void handleCommand(String cmd) {
     flightProfile.drogueRate = extractFloat(cmd, "DROGUE_RATE=", flightProfile.drogueRate);
     flightProfile.restT      = extractFloat(cmd, "REST=", flightProfile.restT);
     Serial.println("[CFG] Profil mis a jour");
+  } else if (cmd.startsWith("DISCONNECT")) {
+    if (cmd.indexOf("KX") > 0) {
+      if (cmd.indexOf("CLEAR") > 0) kx.clearDisconnect();
+      else kx.armDisconnect(extractFloat(cmd, "AT="));
+    }
+    if (cmd.indexOf("BMP3") > 0) {
+      if (cmd.indexOf("CLEAR") > 0) bmp3.clearDisconnect();
+      else bmp3.armDisconnect(extractFloat(cmd, "AT="));
+    }
   } else if (cmd.startsWith("FAULT")) {
     if (cmd.indexOf("BMP3") > 0) applyFault(bmp3, cmd);
   } else if (cmd.startsWith("START")) {
@@ -362,6 +427,7 @@ void handleCommand(String cmd) {
   } else if (cmd.startsWith("RESET")) {
     flightProfile.running = false;
     bmp3.clearFault();
+    kx.clearDisconnect(); bmp3.clearDisconnect();
     Serial.println("[CFG] Reset");
   }
 }
@@ -379,7 +445,7 @@ void parseSerialCommands() {
 void setup() {
   Serial.begin(115200);
   delay(1500);
-  Serial.println("--- Emulateur KX134 + BMP580 (profil + defauts) ---");
+  Serial.println("--- Emulateur KX134 + BMP580 (profil + defauts + deconnexion) ---");
 
   pinMode(LED_PIN, OUTPUT);
 
@@ -393,7 +459,7 @@ void loop() {
   parseSerialCommands();
   float t = flightProfile.elapsed();
   float alt = flightProfile.altitude(t);
-  kx.poll();
+  kx.poll(t);
   bmp3.poll(alt, t);
   updateIdentityBlink();
   delay(20);

@@ -44,10 +44,10 @@ bool  sepmecTriggered = false;
 
 // ================== Profil de vol partage ==================
 struct FlightProfile {
-  float boostAccel = 80.0;  // m/s^2
-  float boostT = 3.0;       // s
-  float drogueRate = 20.0;  // m/s, vitesse de descente constante sous drogue
-  float restT = 0;          // s, temps au repos sur le pas de tir avant le decollage
+  float boostAccel = 80.0;
+  float boostT = 3.0;
+  float drogueRate = 20.0;
+  float restT = 0;
   unsigned long t0 = 0;
   bool running = false;
 
@@ -62,7 +62,6 @@ struct FlightProfile {
     return altBoost + (vBoost * vBoost) / (2 * 9.81);
   }
 
-  // t < 0 : encore au sol (repos ou pas encore demarre) -> altitude 0
   float altitude(float t) const {
     const float g = 9.81;
     if (t < 0) return 0;
@@ -80,10 +79,8 @@ struct FlightProfile {
     return descAlt > 0 ? descAlt : 0;
   }
 
-  // t=0 correspond au decollage ; juste apres START, t = -restT (repos), puis
-  // remonte vers 0 au moment du decollage reel.
   float elapsed() const {
-    if (!running) return -1e6; // jamais demarre - tres negatif, ne matche aucun fault
+    if (!running) return -1e6;
     return (millis() - t0) / 1000.0 - restT;
   }
 };
@@ -105,6 +102,19 @@ public:
   }
 
   void poll(float altitude_m, float t) {
+    // Simule une deconnexion physique (fil coupe / soudure froide).
+    // Reference = instant de reception de la commande DISCONNECT (upload),
+    // PAS le decollage - independant du profil de vol.
+    if (disconnectArmed && !disconnected) {
+      float sinceArm = (millis() - disconnectArmTime) / 1000.0;
+      if (sinceArm >= disconnectAt) {
+        wire->end();
+        disconnected = true;
+        Serial.print("["); Serial.print(name); Serial.println("] [DISCONNECT] simule - plus de reponse I2C");
+      }
+    }
+    if (disconnected) return; // rien tant qu'on n'a pas explicitement reconnecte
+
     updateSimulatedData(altitude_m, t);
     if (millis() - lastActivity > 3000) {
       wire->end(); delay(2); startSlave(savedRecv, savedReq);
@@ -121,6 +131,19 @@ public:
   void clearFault() {
     faultActive = false; faultPersistent = false;
     faultBiasPa = 0; faultStart = 0; faultDuration = 0;
+  }
+
+  void armDisconnect(float atT) {
+    disconnectArmed = true;
+    disconnectAt = atT;
+    disconnectArmTime = millis();
+  }
+  void clearDisconnect() {
+    disconnectArmed = false;
+    if (disconnected) {
+      disconnected = false;
+      startSlave(savedRecv, savedReq); // relance vraiment le peripherique I2C
+    }
   }
 
   void handleReceive(int numBytes) {
@@ -192,6 +215,11 @@ private:
   float faultBiasPa     = 0;
   float faultStart      = 0;
   float faultDuration   = 0;
+
+  bool  disconnectArmed    = false;
+  float disconnectAt       = 0;
+  unsigned long disconnectArmTime = 0;
+  bool  disconnected       = false;
 
   void updateSimulatedData(float altitude_m, float t) {
     float pressure = altitudeToPressure(altitude_m);
@@ -271,6 +299,11 @@ void applyFault(Bmp580Emulator &bmp, String cmd) {
   }
 }
 
+void applyDisconnect(Bmp580Emulator &bmp, String cmd) {
+  if (cmd.indexOf("CLEAR") > 0) { bmp.clearDisconnect(); return; }
+  bmp.armDisconnect(extractFloat(cmd, "AT="));
+}
+
 void handleCommand(String cmd) {
   cmd.trim();
   if (cmd.startsWith("PROFILE")) {
@@ -282,6 +315,9 @@ void handleCommand(String cmd) {
   } else if (cmd.startsWith("SEPMEC")) {
     sepmecOffset = extractFloat(cmd, "OFFSET=");
     Serial.print("[CFG] SEPMEC offset = "); Serial.println(sepmecOffset);
+  } else if (cmd.startsWith("DISCONNECT")) {
+    if (cmd.indexOf("BMP1") > 0) applyDisconnect(bmpA, cmd);
+    if (cmd.indexOf("BMP2") > 0) applyDisconnect(bmpB, cmd);
   } else if (cmd.startsWith("FAULT")) {
     if (cmd.indexOf("BMP1") > 0) applyFault(bmpA, cmd);
     if (cmd.indexOf("BMP2") > 0) applyFault(bmpB, cmd);
@@ -292,6 +328,7 @@ void handleCommand(String cmd) {
   } else if (cmd.startsWith("RESET")) {
     flightProfile.running = false;
     bmpA.clearFault(); bmpB.clearFault();
+    bmpA.clearDisconnect(); bmpB.clearDisconnect();
     sepmecTriggered = false;
     pinMode(SEPMEC_PIN, INPUT);
     Serial.println("[CFG] Reset");
@@ -311,10 +348,10 @@ void parseSerialCommands() {
 void setup() {
   Serial.begin(115200);
   delay(1500);
-  Serial.println("--- Emulateur 2x BMP580 (profil + defauts + sepmec) ---");
+  Serial.println("--- Emulateur 2x BMP580 (profil + defauts + sepmec + deconnexion) ---");
 
   pinMode(LED_PIN, OUTPUT);
-  pinMode(SEPMEC_PIN, INPUT); // Hi-Z par defaut, R7 (10k pulldown) maintient LOW
+  pinMode(SEPMEC_PIN, INPUT);
 
   bmpA.begin(Wire,  4, 5, 0x47, "BMP47", onReceiveA, onRequestA);
   bmpB.begin(Wire1, 6, 7, 0x46, "BMP46", onReceiveB, onRequestB);
@@ -325,7 +362,7 @@ void setup() {
 void loop() {
   parseSerialCommands();
   float t = flightProfile.elapsed();
-  float alt = flightProfile.altitude(t); // gere deja t<0 (repos/pas demarre) -> 0
+  float alt = flightProfile.altitude(t);
   bmpA.poll(alt, t);
   bmpB.poll(alt, t);
   updateSepMech(t);
